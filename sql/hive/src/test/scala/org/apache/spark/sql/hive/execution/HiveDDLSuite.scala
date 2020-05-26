@@ -981,8 +981,8 @@ class HiveDDLSuite
     val expectedSerdePropsString =
       expectedSerdeProps.map { case (k, v) => s"'$k'='$v'" }.mkString(", ")
     val oldPart = catalog.getPartition(TableIdentifier("boxes"), Map("width" -> "4"))
-    assume(oldPart.storage.serde != Some(expectedSerde), "bad test: serde was already set")
-    assume(oldPart.storage.properties.filterKeys(expectedSerdeProps.contains) !=
+    assert(oldPart.storage.serde != Some(expectedSerde), "bad test: serde was already set")
+    assert(oldPart.storage.properties.filterKeys(expectedSerdeProps.contains) !=
       expectedSerdeProps, "bad test: serde properties were already set")
     sql(s"""ALTER TABLE boxes PARTITION (width=4)
       |    SET SERDE '$expectedSerde'
@@ -1735,7 +1735,7 @@ class HiveDDLSuite
     Seq("json", "parquet").foreach { format =>
       withTable("rectangles") {
         data.write.format(format).saveAsTable("rectangles")
-        assume(spark.table("rectangles").collect().nonEmpty,
+        assert(spark.table("rectangles").collect().nonEmpty,
           "bad test; table was empty to begin with")
 
         sql("TRUNCATE TABLE rectangles")
@@ -2315,37 +2315,39 @@ class HiveDDLSuite
 
     implicit val _sqlContext = spark.sqlContext
 
-    Seq((1, "one"), (2, "two"), (4, "four")).toDF("number", "word").createOrReplaceTempView("t1")
-    // Make a table and ensure it will be broadcast.
-    sql("""CREATE TABLE smallTable(word string, number int)
-          |ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
-          |STORED AS TEXTFILE
+    withTempView("t1") {
+      Seq((1, "one"), (2, "two"), (4, "four")).toDF("number", "word").createOrReplaceTempView("t1")
+      // Make a table and ensure it will be broadcast.
+      sql("""CREATE TABLE smallTable(word string, number int)
+            |ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+            |STORED AS TEXTFILE
+          """.stripMargin)
+
+      sql(
+        """INSERT INTO smallTable
+          |SELECT word, number from t1
         """.stripMargin)
 
-    sql(
-      """INSERT INTO smallTable
-        |SELECT word, number from t1
-      """.stripMargin)
+      val inputData = MemoryStream[Int]
+      val joined = inputData.toDS().toDF()
+        .join(spark.table("smallTable"), $"value" === $"number")
 
-    val inputData = MemoryStream[Int]
-    val joined = inputData.toDS().toDF()
-      .join(spark.table("smallTable"), $"value" === $"number")
+      val sq = joined.writeStream
+        .format("memory")
+        .queryName("t2")
+        .start()
+      try {
+        inputData.addData(1, 2)
 
-    val sq = joined.writeStream
-      .format("memory")
-      .queryName("t2")
-      .start()
-    try {
-      inputData.addData(1, 2)
+        sq.processAllAvailable()
 
-      sq.processAllAvailable()
-
-      checkAnswer(
-        spark.table("t2"),
-        Seq(Row(1, "one", 1), Row(2, "two", 2))
-      )
-    } finally {
-      sq.stop()
+        checkAnswer(
+          spark.table("t2"),
+          Seq(Row(1, "one", 1), Row(2, "two", 2))
+        )
+      } finally {
+        sq.stop()
+      }
     }
   }
 
@@ -2701,33 +2703,6 @@ class HiveDDLSuite
         Some("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"))
       assert(table.storage.serde === Some("org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"))
       assert(table.storage.properties("test") == "test")
-    }
-  }
-
-  test("SPARK-30098: create table without provider should " +
-    "use default data source under non-legacy mode") {
-    val catalog = spark.sessionState.catalog
-    withSQLConf(
-      SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT_ENABLED.key -> "false") {
-      withTable("s") {
-        val defaultProvider = conf.defaultDataSourceName
-        sql("CREATE TABLE s(a INT, b INT)")
-        val table = catalog.getTableMetadata(TableIdentifier("s"))
-        assert(table.provider === Some(defaultProvider))
-      }
-    }
-  }
-
-  test("SPARK-30098: create table without provider should " +
-    "use hive under legacy mode") {
-    val catalog = spark.sessionState.catalog
-    withSQLConf(
-      SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT_ENABLED.key -> "true") {
-      withTable("s") {
-        sql("CREATE TABLE s(a INT, b INT)")
-        val table = catalog.getTableMetadata(TableIdentifier("s"))
-        assert(table.provider === Some("hive"))
-      }
     }
   }
 
